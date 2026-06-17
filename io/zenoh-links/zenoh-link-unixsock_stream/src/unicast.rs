@@ -12,8 +12,14 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
-    cell::UnsafeCell, collections::HashMap, fmt, fs::remove_file, os::unix::io::RawFd,
-    path::PathBuf, sync::Arc, time::Duration,
+    cell::UnsafeCell,
+    collections::HashMap,
+    fmt,
+    fs::{remove_file, File, OpenOptions},
+    os::linux::net::SocketAddrExt,
+    os::unix::net::SocketAddr,
+    sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -45,7 +51,7 @@ pub struct LinkUnicastUnixSocketStream {
     socket: UnsafeCell<UnixStream>,
     // The Unix domain socket source path
     src_locator: Locator,
-    // The Unix domain socker destination path (random UUIDv4)
+    // The Unix domain socket destination path (random UUIDv4)
     dst_locator: Locator,
 }
 
@@ -129,9 +135,7 @@ impl LinkUnicastTrait for LinkUnicastUnixSocketStream {
 
     #[inline(always)]
     fn get_interface_names(&self) -> Vec<String> {
-        // @TODO: Not supported for now
-        tracing::debug!("The get_interface_names for LinkUnicastUnixSocketStream is not supported");
-        vec![]
+        vec![] // Unix sockets don't have network interfaces
     }
 
     #[inline(always)]
@@ -181,7 +185,7 @@ struct ListenerUnixSocketStream {
     endpoint: EndPoint,
     token: CancellationToken,
     handle: JoinHandle<ZResult<()>>,
-    lock_fd: RawFd,
+    lock_file: Option<File>,
 }
 
 impl ListenerUnixSocketStream {
@@ -189,13 +193,13 @@ impl ListenerUnixSocketStream {
         endpoint: EndPoint,
         token: CancellationToken,
         handle: JoinHandle<ZResult<()>>,
-        lock_fd: RawFd,
+        lock_file: Option<File>,
     ) -> ListenerUnixSocketStream {
         ListenerUnixSocketStream {
             endpoint,
             token,
             handle,
-            lock_fd,
+            lock_file,
         }
     }
 
@@ -227,13 +231,51 @@ impl LinkManagerUnicastUnixSocketStream {
     }
 }
 
+fn to_socket_addr(path: &str) -> ZResult<(SocketAddr, bool)> {
+    if let Some(abstract_name) = path.strip_prefix('@') {
+        let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())
+            .map_err(|e| zerror!("{}", e))?;
+        Ok((addr, true))
+    } else {
+        let addr = SocketAddr::from_pathname(path).map_err(|e| zerror!("{}", e))?;
+        Ok((addr, false))
+    }
+}
+
+fn socket_addr_to_string(addr: &SocketAddr) -> Option<String> {
+    if let Some(path) = addr.as_pathname() {
+        path.to_str().map(|s| s.to_owned())
+    } else {
+        addr.as_abstract_name()
+            .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+    }
+}
+
+fn tokio_socket_addr_to_string(addr: &tokio::net::unix::SocketAddr) -> Option<String> {
+    if let Some(path) = addr.as_pathname() {
+        path.to_str().map(|s| s.to_owned())
+    } else if addr.is_unnamed() {
+        None
+    } else {
+        let std_addr = unsafe {
+            let raw_addr = addr as *const tokio::net::unix::SocketAddr
+                as *const std::os::unix::net::SocketAddr;
+            &*raw_addr
+        };
+        std_addr
+            .as_abstract_name()
+            .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+    }
+}
+
 #[async_trait]
 impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
     async fn new_link(&self, endpoint: EndPoint) -> ZResult<LinkUnicast> {
         let path = get_unix_path_as_string(endpoint.address());
+        let (addr, _) = to_socket_addr(&path)?;
 
         // Create the UnixSocketStream connection
-        let stream = UnixStream::connect(&path).await.map_err(|e| {
+        let std_stream = std::os::unix::net::UnixStream::connect_addr(&addr).map_err(|e| {
             let e = zerror!(
                 "Can not create a new UnixSocketStream link bound to {:?}: {}",
                 path,
@@ -243,7 +285,11 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
             e
         })?;
 
-        let src_addr = stream.local_addr().map_err(|e| {
+        std_stream
+            .set_nonblocking(true)
+            .map_err(|e| zerror!("{}", e))?;
+
+        let src_addr = std_stream.local_addr().map_err(|e| {
             let e = zerror!(
                 "Can not create a new UnixSocketStream link bound to {:?}: {}",
                 path,
@@ -254,7 +300,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         })?;
 
         // We do need the dst_addr value, we just need to check that is valid
-        let _dst_addr = stream.peer_addr().map_err(|e| {
+        let _dst_addr = std_stream.peer_addr().map_err(|e| {
             let e = zerror!(
                 "Can not create a new UnixSocketStream link bound to {:?}: {}",
                 path,
@@ -264,29 +310,17 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
             e
         })?;
 
-        let local_path = match src_addr.as_pathname() {
-            Some(path) => PathBuf::from(path),
-            None => {
-                let e = format!("Can not create a new UnixSocketStream link bound to {path:?}");
-                tracing::warn!("{}", e);
-                PathBuf::from(format!("{}", Uuid::new_v4()))
-            }
+        let local_path_str = match socket_addr_to_string(&src_addr) {
+            Some(p) => p,
+            None => format!("{}", Uuid::new_v4()),
         };
 
-        let local_path_str = local_path.to_str().ok_or_else(|| {
-            let e = zerror!(
-                "Can not create a new UnixSocketStream link bound to {:?}",
-                path
-            );
-            tracing::warn!("{}", e);
-            e
-        })?;
-
+        let stream = UnixStream::from_std(std_stream).map_err(|e| zerror!("{}", e))?;
         let remote_path_str = path.as_str();
 
         let link: Arc<dyn LinkUnicastTrait> = Arc::new(LinkUnicastUnixSocketStream::new(
             stream,
-            local_path_str,
+            &local_path_str,
             remote_path_str,
         ));
 
@@ -295,6 +329,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
 
     async fn new_listener(&self, mut endpoint: EndPoint) -> ZResult<Locator> {
         let path = get_unix_path_as_string(endpoint.address());
+        let (addr, is_abstract) = to_socket_addr(&path)?;
 
         // Because of the lack of SO_REUSEADDR we have to check if the
         // file is still there and if it is not used by another process.
@@ -308,55 +343,73 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         // Therefore we can unlink the socket file and create the new one with
         // bind(2)
 
-        // We generate the path for the lock file, by adding .lock
-        // to the socket file
-        let lock_file_path = format!("{path}.lock");
+        let mut lock_file_opt = None;
 
-        // We try to open the lock file, with O_RDONLY | O_CREAT
-        // and mode S_IRUSR | S_IWUSR, user read-write permissions
-        let mut open_flags = nix::fcntl::OFlag::empty();
+        if !is_abstract {
+            // We generate the path for the lock file, by adding .lock
+            // to the socket file
+            let lock_file_path = format!("{path}.lock");
 
-        open_flags.insert(nix::fcntl::OFlag::O_CREAT);
-        open_flags.insert(nix::fcntl::OFlag::O_RDONLY);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&lock_file_path)
+                .map_err(|e| {
+                    let e = zerror!(
+                        "Can not create a new UnixSocketStream listener on {} - Unable to open lock file: {}",
+                        path, e
+                    );
+                    tracing::warn!("{}", e);
+                    e
+                })?;
 
-        let mut open_mode = nix::sys::stat::Mode::empty();
-        open_mode.insert(nix::sys::stat::Mode::S_IRUSR);
-        open_mode.insert(nix::sys::stat::Mode::S_IWUSR);
+            // We try to acquire the lock
+            match file.try_lock() {
+                Ok(()) => {
+                    lock_file_opt = Some(file);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let e = zerror!(
+                        "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: WouldBlock",
+                        path
+                    );
+                    tracing::warn!("{}", e);
+                    return Err(e.into());
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    let e = zerror!(
+                        "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: {}",
+                        path,
+                        e
+                    );
+                    tracing::warn!("{}", e);
+                    return Err(e.into());
+                }
+            }
 
-        let lock_fd = nix::fcntl::open(
-            std::path::Path::new(&lock_file_path),
-            open_flags,
-            open_mode,
-        ).map_err(|e| {
-            let e = zerror!(
-                "Can not create a new UnixSocketStream listener on {} - Unable to open lock file: {}",
-                path, e
-            );
-            tracing::warn!("{}", e);
-            e
-        })?;
-
-        // We try to acquire the lock
-        // @TODO: flock is deprecated and upgrading to new Flock will require some refactoring of this module
-        #[allow(deprecated)]
-        nix::fcntl::flock(lock_fd, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|e| {
-            let _ = nix::unistd::close(lock_fd);
-            let e = zerror!(
-                "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: {}",
-                path,
-                e
-            );
-            tracing::warn!("{}", e);
-            e
-        })?;
-
-        //Lock is acquired we can remove the socket file
-        // If the file does not exist this would return an error.
-        // We are not interested if the file was not existing.
-        let _ = remove_file(path.clone());
+            //Lock is acquired we can remove the socket file
+            // If the file does not exist this would return an error.
+            // We are not interested if the file was not existing.
+            let _ = remove_file(path.clone());
+        }
 
         // Bind the Unix socket
-        let socket = UnixListener::bind(&path).map_err(|e| {
+        let std_listener = std::os::unix::net::UnixListener::bind_addr(&addr).map_err(|e| {
+            let e = zerror!(
+                "Can not create a new UnixSocketStream listener on {}: {}",
+                path,
+                e
+            );
+            tracing::warn!("{}", e);
+            e
+        })?;
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| zerror!("{}", e))?;
+
+        let local_addr = std_listener.local_addr().map_err(|e| {
             let e = zerror!(
                 "Can not create a new UnixSocketStream listener on {}: {}",
                 path,
@@ -366,32 +419,18 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
             e
         })?;
 
-        let local_addr = socket.local_addr().map_err(|e| {
-            let e = zerror!(
-                "Can not create a new UnixSocketStream listener on {}: {}",
-                path,
-                e
-            );
-            tracing::warn!("{}", e);
-            e
-        })?;
-
-        let local_path = PathBuf::from(local_addr.as_pathname().ok_or_else(|| {
-            let e = zerror!("Can not create a new UnixSocketStream listener on {}", path);
-            tracing::warn!("{}", e);
-            e
-        })?);
-
-        let local_path_str = local_path.to_str().ok_or_else(|| {
+        let local_path_str = socket_addr_to_string(&local_addr).ok_or_else(|| {
             let e = zerror!("Can not create a new UnixSocketStream listener on {}", path);
             tracing::warn!("{}", e);
             e
         })?;
+
+        let socket = UnixListener::from_std(std_listener).map_err(|e| zerror!("{}", e))?;
 
         // Update the endpoint with the actual local path
         endpoint = EndPoint::new(
             endpoint.protocol(),
-            local_path_str,
+            &local_path_str,
             endpoint.metadata(),
             endpoint.config(),
         )?;
@@ -416,7 +455,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         let handle = zenoh_runtime::ZRuntime::Acceptor.spawn(task);
 
         let locator = endpoint.to_locator();
-        let listener = ListenerUnixSocketStream::new(endpoint, token, handle, lock_fd);
+        let listener = ListenerUnixSocketStream::new(endpoint, token, handle, lock_file_opt);
         listeners.insert(local_path_str.to_owned(), listener);
 
         Ok(locator)
@@ -440,16 +479,15 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         listener.handle.await??;
 
         //Release the lock
-        // @TODO: flock is deprecated and upgrading to new Flock will require some refactoring of this module
-        #[allow(deprecated)]
-        let _ = nix::fcntl::flock(listener.lock_fd, nix::fcntl::FlockArg::UnlockNonblock);
-        let _ = nix::unistd::close(listener.lock_fd);
-        let _ = remove_file(path.clone());
+        if let Some(file) = listener.lock_file {
+            let _ = file.unlock();
+            let _ = remove_file(path.clone());
 
-        // Remove the Unix Domain Socket file
-        let lock_file_path = format!("{path}.lock");
-        let tmp = remove_file(lock_file_path);
-        tracing::trace!("UnixSocketStream Domain Socket removal result: {:?}", tmp);
+            // Remove the Unix Domain Socket file
+            let lock_file_path = format!("{path}.lock");
+            let tmp = remove_file(lock_file_path);
+            tracing::trace!("UnixSocketStream Domain Socket removal result: {:?}", tmp);
+        }
 
         Ok(())
     }
@@ -485,23 +523,17 @@ async fn accept_task(
         e
     })?;
 
-    let local_path = PathBuf::from(src_addr.as_pathname().ok_or_else(|| {
-        let e = zerror!(
-            "Can not create a new UnixSocketStream link bound to {:?}",
-            src_addr
-        );
-        tracing::warn!("{}", e);
-        e
-    })?);
-
-    let src_path = local_path.to_str().ok_or_else(|| {
-        let e = zerror!(
-            "Can not create a new UnixSocketStream link bound to {:?}",
-            src_addr
-        );
-        tracing::warn!("{}", e);
-        e
-    })?;
+    let src_path = match tokio_socket_addr_to_string(&src_addr) {
+        Some(p) => p,
+        None => {
+            let e = zerror!(
+                "Can not create a new UnixSocketStream link bound to {:?}",
+                src_addr
+            );
+            tracing::warn!("{}", e);
+            return Err(e.into());
+        }
+    };
 
     // The accept future
     tracing::trace!(
@@ -522,7 +554,7 @@ async fn accept_task(
 
                         // Create the new link object
                         let link: Arc<dyn LinkUnicastTrait> = Arc::new(LinkUnicastUnixSocketStream::new(
-                            stream, src_path, &dst_path,
+                            stream, &src_path, &dst_path,
                         ));
 
                         // Communicate the new link to the initial transport manager
