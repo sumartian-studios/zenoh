@@ -16,11 +16,15 @@ use std::{
     collections::HashMap,
     fmt,
     fs::{remove_file, File, OpenOptions},
-    os::linux::net::SocketAddrExt,
     os::unix::net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
+
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+
+use tokio::select;
 
 use async_trait::async_trait;
 use tokio::{
@@ -233,9 +237,17 @@ impl LinkManagerUnicastUnixSocketStream {
 
 fn to_socket_addr(path: &str) -> ZResult<(SocketAddr, bool)> {
     if let Some(abstract_name) = path.strip_prefix('@') {
-        let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())
-            .map_err(|e| zerror!("{}", e))?;
-        Ok((addr, true))
+        #[cfg(target_os = "linux")]
+        {
+            let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())
+                .map_err(|e| zerror!("{}", e))?;
+            Ok((addr, true))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = abstract_name;
+            Err(zerror!("Abstract Unix sockets ('@') are only supported on Linux").into())
+        }
     } else {
         let addr = SocketAddr::from_pathname(path).map_err(|e| zerror!("{}", e))?;
         Ok((addr, false))
@@ -246,8 +258,15 @@ fn socket_addr_to_string(addr: &SocketAddr) -> Option<String> {
     if let Some(path) = addr.as_pathname() {
         path.to_str().map(|s| s.to_owned())
     } else {
-        addr.as_abstract_name()
-            .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+        #[cfg(target_os = "linux")]
+        {
+            addr.as_abstract_name()
+                .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 }
 
@@ -257,14 +276,21 @@ fn tokio_socket_addr_to_string(addr: &tokio::net::unix::SocketAddr) -> Option<St
     } else if addr.is_unnamed() {
         None
     } else {
-        let std_addr = unsafe {
-            let raw_addr = addr as *const tokio::net::unix::SocketAddr
-                as *const std::os::unix::net::SocketAddr;
-            &*raw_addr
-        };
-        std_addr
-            .as_abstract_name()
-            .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+        #[cfg(target_os = "linux")]
+        {
+            let std_addr = unsafe {
+                let raw_addr = addr as *const tokio::net::unix::SocketAddr
+                    as *const std::os::unix::net::SocketAddr;
+                &*raw_addr
+            };
+            std_addr
+                .as_abstract_name()
+                .map(|name| format!("@{}", String::from_utf8_lossy(name)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 }
 
@@ -346,53 +372,63 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         let mut lock_file_opt = None;
 
         if !is_abstract {
-            // We generate the path for the lock file, by adding .lock
-            // to the socket file
             let lock_file_path = format!("{path}.lock");
+            let lock_file_path_clone = lock_file_path.clone();
+            let path_clone = path.clone();
 
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&lock_file_path)
-                .map_err(|e| {
-                    let e = zerror!(
-                        "Can not create a new UnixSocketStream listener on {} - Unable to open lock file: {}",
-                        path, e
-                    );
-                    tracing::warn!("{}", e);
-                    e
-                })?;
+            let lock_result = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::MetadataExt;
 
-            // We try to acquire the lock
-            match file.try_lock() {
-                Ok(()) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&lock_file_path_clone)
+                    .map_err(|e| {
+                        zerror!(
+                            "Can not create a new UnixSocketStream listener on {} - Unable to open lock file: {}",
+                            path_clone, e
+                        )
+                    })?;
+
+                if let Err(err) = file.try_lock() {
+                    return Err(match err {
+                        std::fs::TryLockError::WouldBlock => zerror!(
+                            "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: WouldBlock",
+                            path_clone
+                        ),
+                        std::fs::TryLockError::Error(e) => zerror!(
+                            "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: {}",
+                            path_clone, e
+                        ),
+                    });
+                }
+
+                let meta_fd = file.metadata().map_err(|e| zerror!("{}", e))?;
+                let meta_disk = std::fs::metadata(&lock_file_path_clone).map_err(|e| zerror!("{}", e))?;
+                if meta_fd.dev() != meta_disk.dev() || meta_fd.ino() != meta_disk.ino() {
+                    return Err(zerror!(
+                        "Can not create a new UnixSocketStream listener on {} - Lockfile was substituted during acquisition",
+                        path_clone
+                    ));
+                }
+
+                let _ = remove_file(path_clone);
+                Ok(file)
+            })
+            .await
+            .map_err(|e| zerror!("Spawn blocking join error: {}", e))?;
+
+            match lock_result {
+                Ok(file) => {
                     lock_file_opt = Some(file);
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    let e = zerror!(
-                        "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: WouldBlock",
-                        path
-                    );
-                    tracing::warn!("{}", e);
-                    return Err(e.into());
-                }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    let e = zerror!(
-                        "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: {}",
-                        path,
-                        e
-                    );
+                Err(e) => {
                     tracing::warn!("{}", e);
                     return Err(e.into());
                 }
             }
-
-            //Lock is acquired we can remove the socket file
-            // If the file does not exist this would return an error.
-            // We are not interested if the file was not existing.
-            let _ = remove_file(path.clone());
         }
 
         // Bind the Unix socket
@@ -478,15 +514,21 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         listener.stop().await;
         listener.handle.await??;
 
-        //Release the lock
+        // Release the lock safely
         if let Some(file) = listener.lock_file {
-            let _ = file.unlock();
-            let _ = remove_file(path.clone());
-
-            // Remove the Unix Domain Socket file
             let lock_file_path = format!("{path}.lock");
-            let tmp = remove_file(lock_file_path);
-            tracing::trace!("UnixSocketStream Domain Socket removal result: {:?}", tmp);
+            let path_clone = path.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let _ = remove_file(path_clone);
+
+                let tmp = remove_file(lock_file_path);
+                tracing::trace!("UnixSocketStream Domain Socket removal result: {:?}", tmp);
+
+                let _ = file.unlock();
+            })
+            .await
+            .map_err(|e| zerror!("Spawn blocking join error: {}", e))?;
         }
 
         Ok(())
@@ -512,11 +554,6 @@ async fn accept_task(
     token: CancellationToken,
     manager: NewLinkChannelSender,
 ) -> ZResult<()> {
-    async fn accept(socket: &UnixListener) -> ZResult<UnixStream> {
-        let (stream, _) = socket.accept().await.map_err(|e| zerror!(e))?;
-        Ok(stream)
-    }
-
     let src_addr = socket.local_addr().map_err(|e| {
         zerror!("Can not accept UnixSocketStream connections: {}", e);
         tracing::warn!("{}", e);
@@ -535,44 +572,41 @@ async fn accept_task(
         }
     };
 
-    // The accept future
     tracing::trace!(
         "Ready to accept UnixSocketStream connections on: {}",
         src_path
     );
 
     loop {
-        tokio::select! {
+        select! {
             _ = token.cancelled() => break,
 
-            res = accept(&socket) => {
-                match res {
-                    Ok(stream) => {
-                        let dst_path = format!("{}", Uuid::new_v4());
-
-                        tracing::debug!("Accepted UnixSocketStream connection on: {:?}", src_addr,);
-
-                        // Create the new link object
-                        let link: Arc<dyn LinkUnicastTrait> = Arc::new(LinkUnicastUnixSocketStream::new(
-                            stream, &src_path, &dst_path,
-                        ));
-
-                        // Communicate the new link to the initial transport manager
-                        if let Err(e) = manager.send_async(LinkUnicast::from(link)).await {
-                            tracing::error!("{}-{}: {}", file!(), line!(), e)
-                        }
-
-                    }
+            res = socket.accept() => {
+                let (stream, _) = match res {
+                    Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!("{}. Hint: increase the system open file limit.", e);
                         // Throttle the accept loop upon an error
                         // NOTE: This might be due to various factors. However, the most common case is that
                         //       the process has reached the maximum number of open files in the system. On
                         //       Linux systems this limit can be changed by using the "ulimit" command line
                         //       tool. In case of systemd-based systems, this can be changed by using the
                         //       "sysctl" command line tool.
+                        tracing::warn!("{}. Hint: increase the system open file limit.", e);
                         tokio::time::sleep(Duration::from_micros(*UNIXSOCKSTREAM_ACCEPT_THROTTLE_TIME)).await;
+                        continue;
                     }
+                };
+
+                let dst_path = Uuid::new_v4().to_string();
+
+                tracing::debug!("Accepted UnixSocketStream connection on: {:?}", src_addr);
+
+                let link: Arc<dyn LinkUnicastTrait> = Arc::new(
+                    LinkUnicastUnixSocketStream::new(stream, &src_path, &dst_path),
+                );
+
+                if let Err(e) = manager.send_async(LinkUnicast::from(link)).await {
+                    tracing::error!("{}-{}: {}", file!(), line!(), e);
                 }
             }
         }
